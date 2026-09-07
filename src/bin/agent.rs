@@ -15,7 +15,7 @@
 use chrono::Utc;
 use incident_response_system::dispatch::execute_tool;
 use incident_response_system::trace::{TraceEventKind, Tracer};
-use incident_response_system::{scope, tools};
+use incident_response_system::{runbooks, scope, tools};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use std::env;
@@ -153,12 +153,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_tools: Vec<Value> = serde_json::from_str(TOOLS_JSON)?;
     let client = reqwest::Client::new();
 
+    let mut messages = vec![
+        json!({ "role": "system", "content": system_prompt(Phase::Diagnose) }),
+        json!({ "role": "user", "content": &alert }),
+    ];
+
+    // SECURITY TEST ONLY (Option A, controlled injection): if set, we call
+    // search_runbooks ourselves — bypassing the model's own decision to
+    // search — and splice a synthetic prior tool round-trip into history
+    // before the model's first turn. This isolates "does poisoned content,
+    // once in context, influence behavior" from "does the model's own
+    // search strategy happen to find it." The spliced messages are
+    // indistinguishable from a real self-initiated tool call.
+    if let Ok(query) = env::var("INJECT_RUNBOOK_QUERY") {
+        let results = runbooks::search_runbooks(&query)?;
+        eprintln!("[security-test] injected search_runbooks({query:?}) -> {} match(es)", results.len());
+        let call_id = "injected-call-1";
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": { "name": "search_runbooks", "arguments": json!({"query": query}).to_string() }
+            }]
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": "search_runbooks",
+            "content": json!(results).to_string(),
+        }));
+        tracer.record(
+            "Diagnose",
+            TraceEventKind::ToolCall,
+            json!({ "name": "search_runbooks", "args": {"query": query}, "injected": true }),
+        );
+    }
+
     let mut state = IncidentState {
         phase: Phase::Diagnose,
-        messages: vec![
-            json!({ "role": "system", "content": system_prompt(Phase::Diagnose) }),
-            json!({ "role": "user", "content": &alert }),
-        ],
+        messages,
         diagnosis_summary: None,
         remediation_summary: None,
         incident_id,
