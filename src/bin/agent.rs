@@ -14,6 +14,8 @@
 
 use chrono::Utc;
 use incident_response_system::dispatch::execute_tool;
+use incident_response_system::trace::{TraceEventKind, Tracer};
+use incident_response_system::{scope, tools};
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use std::env;
@@ -122,6 +124,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "API latency spike on checkout-service, p99 > 2000ms for 5 minutes.".to_string());
 
+    let incident_id = format!("INC-{}", Utc::now().format("%Y%m%d%H%M%S"));
+    let mut tracer = Tracer::new(&incident_id)?;
+
+    // Scope guardrail: refuse anything that isn't an incident on a known
+    // service *before* the model ever sees it — a prompt injection later
+    // in the conversation can't talk its way around a check that already
+    // ran and already said no.
+    let known_services: Vec<String> = tools::get_services(&pool)
+        .await?
+        .into_iter()
+        .map(|s| s.service_name)
+        .collect();
+    if !scope::is_in_scope(&alert, &known_services) {
+        println!(
+            "Out of scope: this system only handles infrastructure incidents for known \
+             services ({}). Refusing to process: \"{alert}\"",
+            known_services.join(", ")
+        );
+        tracer.record(
+            "None",
+            TraceEventKind::Refused,
+            json!({ "alert": alert, "known_services": known_services }),
+        );
+        return Ok(());
+    }
+
     let all_tools: Vec<Value> = serde_json::from_str(TOOLS_JSON)?;
     let client = reqwest::Client::new();
 
@@ -133,13 +161,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ],
         diagnosis_summary: None,
         remediation_summary: None,
-        incident_id: format!("INC-{}", Utc::now().format("%Y%m%d%H%M%S")),
+        incident_id,
     };
 
     for _ in 0..MAX_MODEL_CALLS {
         if state.phase == Phase::Done {
             break;
         }
+        let phase_label = format!("{:?}", state.phase);
 
         let body = json!({
             "model": model,
@@ -147,16 +176,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "tools": tools_for_phase(&all_tools, state.phase),
             "tool_choice": "auto",
         });
+        tracer.record(&phase_label, TraceEventKind::ModelCall, json!({ "model": model }));
 
         let response = call_groq(&client, &api_key, &body).await?;
         let message = response["choices"][0]["message"].clone();
         let tool_calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
         state.messages.push(message.clone());
+        tracer.record(
+            &phase_label,
+            TraceEventKind::ModelResponse,
+            json!({ "content": message["content"], "tool_call_count": tool_calls.len() }),
+        );
 
         if tool_calls.is_empty() {
             let text = message["content"].as_str().unwrap_or("").to_string();
             println!("[{:?}] {text}", state.phase);
-            advance_phase(&mut state, text, &alert);
+            advance_phase(&mut state, text, &alert, &mut tracer);
             continue;
         }
 
@@ -166,10 +201,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args: Value = serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
 
             println!("-> [{:?}] calling tool: {name}({args})", state.phase);
+            tracer.record(&phase_label, TraceEventKind::ToolCall, json!({ "name": name, "args": args }));
+
             let result = match execute_tool(&pool, name, &args).await {
                 Ok(v) => v,
                 Err(e) => json!({ "error": e }),
             };
+            tracer.record(
+                &phase_label,
+                TraceEventKind::ToolResult,
+                json!({ "name": name, "result": result }),
+            );
 
             state.messages.push(json!({
                 "role": "tool",
@@ -188,8 +230,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Moves to the next phase and replaces `messages` with a fresh prompt
 /// built from the previous phase's summary — the raw tool-call history
-/// that produced it is dropped, not carried forward.
-fn advance_phase(state: &mut IncidentState, final_text: String, alert: &str) {
+/// that produced it is dropped, not carried forward. Records the handoff
+/// itself (`from` phase, `to` phase, and the summary that crossed) so the
+/// trace shows which sub-agent took over and what it was told.
+fn advance_phase(state: &mut IncidentState, final_text: String, alert: &str, tracer: &mut Tracer) {
+    let from = format!("{:?}", state.phase);
+
     match state.phase {
         Phase::Diagnose => {
             state.diagnosis_summary = Some(final_text.clone());
@@ -223,6 +269,12 @@ fn advance_phase(state: &mut IncidentState, final_text: String, alert: &str) {
         }
         Phase::Done => {}
     }
+
+    tracer.record(
+        &from,
+        TraceEventKind::PhaseTransition,
+        json!({ "from": from, "to": format!("{:?}", state.phase), "summary": final_text }),
+    );
 }
 
 /// Calls Groq, retrying on a rate-limit response (the free tier's TPM cap
