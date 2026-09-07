@@ -23,10 +23,13 @@ pub struct Metric {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Normalized to `service` (the legacy `logs` table's actual column is
+/// `svc_name`) so callers never need to know the log export uses a
+/// different name than `metrics`/`services`/etc. do.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct Log {
     pub id: i32,
-    pub svc_name: String,
+    pub service: String,
     pub level: String,
     pub message: String,
     pub err_count: i32,
@@ -65,6 +68,14 @@ pub async fn get_services(pool: &PgPool) -> Result<Vec<Service>, sqlx::Error> {
         .await
 }
 
+/// One service by name, if known — used by the permission layer to check criticality.
+pub async fn get_service(pool: &PgPool, service_name: &str) -> Result<Option<Service>, sqlx::Error> {
+    sqlx::query_as("SELECT service_name, criticality, owner_team FROM services WHERE service_name = $1")
+        .bind(service_name)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Metrics for one service, oldest first.
 pub async fn get_metrics_for_service(
     pool: &PgPool,
@@ -79,13 +90,15 @@ pub async fn get_metrics_for_service(
     .await
 }
 
-/// Legacy log export rows for one service (svc_name, not service — different schema).
-pub async fn get_logs_for_service(pool: &PgPool, svc_name: &str) -> Result<Vec<Log>, sqlx::Error> {
+/// Legacy log export rows for one service. The underlying column is
+/// `svc_name`, not `service` — aliased away here so it's invisible outside
+/// this query.
+pub async fn get_logs_for_service(pool: &PgPool, service: &str) -> Result<Vec<Log>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, svc_name, level, message, err_count, date
+        "SELECT id, svc_name AS service, level, message, err_count, date
          FROM logs WHERE svc_name = $1 ORDER BY id",
     )
-    .bind(svc_name)
+    .bind(service)
     .fetch_all(pool)
     .await
 }
@@ -158,6 +171,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_service_finds_a_known_service() {
+        let pool = test_pool().await;
+        let service = get_service(&pool, "checkout-service").await.unwrap().unwrap();
+        assert_eq!(service.criticality, "critical");
+    }
+
+    #[tokio::test]
+    async fn get_service_returns_none_for_unknown_service() {
+        let pool = test_pool().await;
+        assert!(get_service(&pool, "nonexistent-service").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn get_metrics_for_service_returns_baseline_then_spike_in_order() {
         let pool = test_pool().await;
         let metrics = get_metrics_for_service(&pool, "checkout-service").await.unwrap();
@@ -183,6 +209,8 @@ mod tests {
         let pool = test_pool().await;
         let logs = get_logs_for_service(&pool, "checkout-service").await.unwrap();
         assert_eq!(logs.len(), 3); // 1 INFO baseline + 2 incident rows
+        // Normalized: `Log.service`, not the underlying column's `svc_name`.
+        assert!(logs.iter().all(|l| l.service == "checkout-service"));
         assert!(logs.iter().any(|l| l.level == "INFO"));
         assert!(logs.iter().any(|l| l.level == "ERROR" && l.message.contains("payment-gateway")));
         assert!(logs.iter().any(|l| l.level == "WARN" && l.message.contains("connection pool exhausted")));

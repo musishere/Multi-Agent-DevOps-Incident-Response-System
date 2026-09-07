@@ -25,13 +25,13 @@
     "type": "function",
     "function": {
       "name": "get_logs_for_service",
-      "description": "Returns legacy log-export rows for one service (batch-based, not real-time). Uses svc_name and a date string (MM/DD/YYYY) — different field names than the metrics source.",
+      "description": "Returns legacy log-export rows for one service (batch-based, not real-time; date is a string, MM/DD/YYYY, not a timestamp). The underlying export uses svc_name internally, but this tool normalizes that to the same 'service' name used everywhere else.",
       "parameters": {
         "type": "object",
         "properties": {
-          "svc_name": { "type": "string", "description": "Service name as recorded in the legacy log export" }
+          "service": { "type": "string", "description": "Service name, e.g. checkout-service" }
         },
-        "required": ["svc_name"]
+        "required": ["service"]
       }
     }
   },
@@ -92,14 +92,59 @@
     "type": "function",
     "function": {
       "name": "execute_remediation",
-      "description": "Executes a remediation action against a service and logs it. Skeleton only — not yet gated by a permission/risk-tier guardrail layer.",
+      "description": "Executes a free-form remediation action (e.g. restart_pod) against a service and logs it. Use scale_service/rollback_deployment/delete_resource instead when the action fits one of those. Skeleton only — not yet gated by a permission/risk-tier guardrail layer.",
       "parameters": {
         "type": "object",
         "properties": {
           "service": { "type": "string" },
-          "action": { "type": "string", "description": "e.g. restart_pod, scale_service, rollback_deployment" }
+          "action": { "type": "string", "description": "e.g. restart_pod" }
         },
         "required": ["service", "action"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "scale_service",
+      "description": "Scales a service's replica count by a signed percentage and logs it. Skeleton only — the spec calls for auto-approval only within a safe range (e.g. ±20%) and confirmation outside it; not enforced here.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string" },
+          "target_percent": {
+            "type": "integer",
+            "description": "Signed percent change, e.g. 20 for +20%, -10 for -10%"
+          }
+        },
+        "required": ["service", "target_percent"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "rollback_deployment",
+      "description": "Rolls a service's deployment back to its last known-good version and logs it. Skeleton only — the spec calls for this to always require human confirmation (high blast radius); not enforced here.",
+      "parameters": {
+        "type": "object",
+        "properties": { "service": { "type": "string" } },
+        "required": ["service"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_resource",
+      "description": "Deletes a named infrastructure resource and logs it. Skeleton only — the spec calls for confirmation plus a sandboxed dry-run first (highest-stakes action); not enforced here.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string" },
+          "resource": { "type": "string", "description": "Identifier of the resource to delete" }
+        },
+        "required": ["service", "resource"]
       }
     }
   },

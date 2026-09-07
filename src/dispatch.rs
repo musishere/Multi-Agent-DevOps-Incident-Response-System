@@ -5,6 +5,7 @@
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
+use crate::permissions::Tier;
 use crate::{actions, runbooks, tools};
 
 pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Value, String> {
@@ -22,8 +23,8 @@ pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Val
         }
 
         "get_logs_for_service" => {
-            let svc_name = arg_str(args, "svc_name")?;
-            tools::get_logs_for_service(pool, svc_name)
+            let service = arg_str(args, "service")?;
+            tools::get_logs_for_service(pool, service)
                 .await
                 .map(|v| json!(v))
                 .map_err(db_err)
@@ -63,10 +64,35 @@ pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Val
         "execute_remediation" => {
             let service = arg_str(args, "service")?;
             let action = arg_str(args, "action")?;
-            actions::execute_remediation(pool, service, action)
+            let criticality = service_criticality(pool, service).await?;
+            let tier = actions::execute_remediation(pool, service, &criticality, action)
                 .await
-                .map(|_| json!({ "status": "logged" }))
-                .map_err(db_err)
+                .map_err(db_err)?;
+            Ok(tier_result(tier))
+        }
+
+        "scale_service" => {
+            let service = arg_str(args, "service")?;
+            let target_percent = arg_i64(args, "target_percent")? as i32;
+            let tier = actions::scale_service(pool, service, target_percent)
+                .await
+                .map_err(db_err)?;
+            Ok(tier_result(tier))
+        }
+
+        "rollback_deployment" => {
+            let service = arg_str(args, "service")?;
+            let tier = actions::rollback_deployment(pool, service).await.map_err(db_err)?;
+            Ok(tier_result(tier))
+        }
+
+        "delete_resource" => {
+            let service = arg_str(args, "service")?;
+            let resource = arg_str(args, "resource")?;
+            let tier = actions::delete_resource(pool, service, resource)
+                .await
+                .map_err(db_err)?;
+            Ok(tier_result(tier))
         }
 
         "post_incident_update" => {
@@ -86,6 +112,29 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing required string arg: {key}"))
+}
+
+fn arg_i64(args: &Value, key: &str) -> Result<i64, String> {
+    args.get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| format!("missing required integer arg: {key}"))
+}
+
+/// Looks up a service's criticality tier for the permission layer.
+/// An unknown service defaults to "critical" — fail-safe, not an oversight.
+async fn service_criticality(pool: &PgPool, service: &str) -> Result<String, String> {
+    tools::get_service(pool, service)
+        .await
+        .map(|found| found.map(|s| s.criticality).unwrap_or_else(|| "critical".to_string()))
+        .map_err(|e| e.to_string())
+}
+
+fn tier_result(tier: Tier) -> Value {
+    match tier {
+        Tier::Auto => json!({ "status": "logged" }),
+        Tier::Confirm(reason) => json!({ "status": "confirmation_required", "reason": reason }),
+        Tier::Duplicate(reason) => json!({ "status": "duplicate_suppressed", "reason": reason }),
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +159,72 @@ mod tests {
         let pool = test_pool().await;
         let result = execute_tool(&pool, "get_metrics_for_service", &json!({})).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatches_the_new_remediation_tools_by_name() {
+        let pool = test_pool().await;
+        let service = "test-dispatch-remediation";
+
+        let scale = execute_tool(&pool, "scale_service", &json!({"service": service, "target_percent": -10}))
+            .await
+            .unwrap();
+        assert_eq!(scale["status"], "logged"); // -10% is within the auto range
+
+        let rollback = execute_tool(&pool, "rollback_deployment", &json!({"service": service}))
+            .await
+            .unwrap();
+        assert_eq!(rollback["status"], "confirmation_required"); // never auto
+
+        let delete = execute_tool(
+            &pool,
+            "delete_resource",
+            &json!({"service": service, "resource": "stale-cache-volume"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(delete["status"], "confirmation_required"); // never auto
+
+        let log = tools::get_remediation_log_for_service(&pool, service).await.unwrap();
+        assert_eq!(log.len(), 3);
+
+        sqlx::query("DELETE FROM remediation_log WHERE service = $1")
+            .bind(service)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_remediation_gates_restart_pod_by_real_service_criticality() {
+        let pool = test_pool().await;
+
+        // checkout-service is seeded as criticality = "critical".
+        let blocked = execute_tool(
+            &pool,
+            "execute_remediation",
+            &json!({"service": "checkout-service", "action": "restart_pod"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(blocked["status"], "confirmation_required");
+
+        // recommendation-service is seeded as criticality = "medium".
+        let allowed = execute_tool(
+            &pool,
+            "execute_remediation",
+            &json!({"service": "recommendation-service", "action": "restart_pod"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(allowed["status"], "logged");
+
+        sqlx::query("DELETE FROM remediation_log WHERE service IN ($1, $2)")
+            .bind("checkout-service")
+            .bind("recommendation-service")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
