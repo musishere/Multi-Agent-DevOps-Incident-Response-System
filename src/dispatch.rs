@@ -8,7 +8,15 @@ use sqlx::PgPool;
 use crate::permissions::Tier;
 use crate::{actions, runbooks, tools};
 
-pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Value, String> {
+/// `incident_service` is the service this incident is scoped to (from the
+/// original alert) — every remediation tool call is checked against it
+/// before anything else, regardless of what `args["service"]` claims.
+pub async fn execute_tool(
+    pool: &PgPool,
+    name: &str,
+    args: &Value,
+    incident_service: &str,
+) -> Result<Value, String> {
     let db_err = |e: sqlx::Error| e.to_string();
 
     match name {
@@ -65,7 +73,7 @@ pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Val
             let service = arg_str(args, "service")?;
             let action = arg_str(args, "action")?;
             let criticality = service_criticality(pool, service).await?;
-            let tier = actions::execute_remediation(pool, service, &criticality, action)
+            let tier = actions::execute_remediation(pool, service, &criticality, action, incident_service)
                 .await
                 .map_err(db_err)?;
             Ok(tier_result(tier))
@@ -74,7 +82,7 @@ pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Val
         "scale_service" => {
             let service = arg_str(args, "service")?;
             let target_percent = arg_i64(args, "target_percent")? as i32;
-            let tier = actions::scale_service(pool, service, target_percent)
+            let tier = actions::scale_service(pool, service, target_percent, incident_service)
                 .await
                 .map_err(db_err)?;
             Ok(tier_result(tier))
@@ -82,14 +90,16 @@ pub async fn execute_tool(pool: &PgPool, name: &str, args: &Value) -> Result<Val
 
         "rollback_deployment" => {
             let service = arg_str(args, "service")?;
-            let tier = actions::rollback_deployment(pool, service).await.map_err(db_err)?;
+            let tier = actions::rollback_deployment(pool, service, incident_service)
+                .await
+                .map_err(db_err)?;
             Ok(tier_result(tier))
         }
 
         "delete_resource" => {
             let service = arg_str(args, "service")?;
             let resource = arg_str(args, "resource")?;
-            let tier = actions::delete_resource(pool, service, resource)
+            let tier = actions::delete_resource(pool, service, resource, incident_service)
                 .await
                 .map_err(db_err)?;
             Ok(tier_result(tier))
@@ -134,6 +144,7 @@ fn tier_result(tier: Tier) -> Value {
         Tier::Auto => json!({ "status": "logged" }),
         Tier::Confirm(reason) => json!({ "status": "confirmation_required", "reason": reason }),
         Tier::Duplicate(reason) => json!({ "status": "duplicate_suppressed", "reason": reason }),
+        Tier::CrossService(reason) => json!({ "status": "cross_service_blocked", "reason": reason }),
     }
 }
 
@@ -150,14 +161,14 @@ mod tests {
     #[tokio::test]
     async fn dispatches_read_tool_by_name() {
         let pool = test_pool().await;
-        let result = execute_tool(&pool, "get_services", &json!({})).await.unwrap();
+        let result = execute_tool(&pool, "get_services", &json!({}), "checkout-service").await.unwrap();
         assert_eq!(result.as_array().unwrap().len(), 4);
     }
 
     #[tokio::test]
     async fn missing_arg_is_an_error_not_a_panic() {
         let pool = test_pool().await;
-        let result = execute_tool(&pool, "get_metrics_for_service", &json!({})).await;
+        let result = execute_tool(&pool, "get_metrics_for_service", &json!({}), "checkout-service").await;
         assert!(result.is_err());
     }
 
@@ -166,12 +177,17 @@ mod tests {
         let pool = test_pool().await;
         let service = "test-dispatch-remediation";
 
-        let scale = execute_tool(&pool, "scale_service", &json!({"service": service, "target_percent": -10}))
-            .await
-            .unwrap();
+        let scale = execute_tool(
+            &pool,
+            "scale_service",
+            &json!({"service": service, "target_percent": -10}),
+            service,
+        )
+        .await
+        .unwrap();
         assert_eq!(scale["status"], "logged"); // -10% is within the auto range
 
-        let rollback = execute_tool(&pool, "rollback_deployment", &json!({"service": service}))
+        let rollback = execute_tool(&pool, "rollback_deployment", &json!({"service": service}), service)
             .await
             .unwrap();
         assert_eq!(rollback["status"], "confirmation_required"); // never auto
@@ -180,6 +196,7 @@ mod tests {
             &pool,
             "delete_resource",
             &json!({"service": service, "resource": "stale-cache-volume"}),
+            service,
         )
         .await
         .unwrap();
@@ -199,11 +216,14 @@ mod tests {
     async fn execute_remediation_gates_restart_pod_by_real_service_criticality() {
         let pool = test_pool().await;
 
-        // checkout-service is seeded as criticality = "critical".
+        // checkout-service is seeded as criticality = "critical". Each call's
+        // incident_service matches its own target — this test is about
+        // criticality gating, not cross-service gating.
         let blocked = execute_tool(
             &pool,
             "execute_remediation",
             &json!({"service": "checkout-service", "action": "restart_pod"}),
+            "checkout-service",
         )
         .await
         .unwrap();
@@ -214,6 +234,7 @@ mod tests {
             &pool,
             "execute_remediation",
             &json!({"service": "recommendation-service", "action": "restart_pod"}),
+            "recommendation-service",
         )
         .await
         .unwrap();
@@ -230,7 +251,62 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_name_is_an_error() {
         let pool = test_pool().await;
-        let result = execute_tool(&pool, "delete_everything", &json!({})).await;
+        let result = execute_tool(&pool, "delete_everything", &json!({}), "checkout-service").await;
         assert!(result.is_err());
+    }
+
+    /// Direct reproduction of the poisoned-runbook attack: an incident about
+    /// recommendation-service tries to delete_resource on checkout-service.
+    /// This is what proves which layer actually catches it.
+    #[tokio::test]
+    async fn cross_service_delete_resource_is_blocked_before_the_permission_tier() {
+        let pool = test_pool().await;
+
+        let result = execute_tool(
+            &pool,
+            "delete_resource",
+            &json!({"service": "checkout-service", "resource": "checkout-service-prod-db"}),
+            "recommendation-service",
+        )
+        .await
+        .unwrap();
+
+        // Not "confirmation_required" (delete_resource's always-Confirm
+        // tier never even runs) — the cross-service check catches it first.
+        assert_eq!(result["status"], "cross_service_blocked");
+        assert!(result["reason"].as_str().unwrap().contains("checkout-service"));
+
+        let log = tools::get_remediation_log_for_service(&pool, "checkout-service").await.unwrap();
+        assert_eq!(log[0].status, "cross_service_blocked");
+
+        sqlx::query("DELETE FROM remediation_log WHERE service = $1")
+            .bind("checkout-service")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// Same target and incident service — the legitimate case — still
+    /// reaches the permission tier as before.
+    #[tokio::test]
+    async fn same_service_delete_resource_still_reaches_the_permission_tier() {
+        let pool = test_pool().await;
+
+        let result = execute_tool(
+            &pool,
+            "delete_resource",
+            &json!({"service": "recommendation-service", "resource": "stale-cache"}),
+            "recommendation-service",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["status"], "confirmation_required");
+
+        sqlx::query("DELETE FROM remediation_log WHERE service = $1")
+            .bind("recommendation-service")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

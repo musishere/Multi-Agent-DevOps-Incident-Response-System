@@ -1,16 +1,19 @@
 //! Write-side tools for the Remediation/Communication sub-agents.
 //!
-//! Before anything else, each remediation action checks its own recent
-//! history for loop detection: the same (service, action) pair attempted
-//! again within `DUPLICATE_WINDOW_MINUTES` of a still-standing attempt is
-//! suppressed instead of re-run — a retrying agent (or a human mashing
-//! the same button) doesn't get to restart the same pod five times in a
-//! row. Only past that check does `permissions::check_*` decide `Auto`
-//! (logged `completed`) vs `Confirm` (logged `pending_confirmation`).
+//! Every remediation action passes through `guarded()`, in this order:
+//! 1. **Cross-service check** — is `service` even the service this
+//!    incident is about? A poisoned runbook trying to redirect remediation
+//!    at an unrelated service is refused here, before anything else runs.
+//! 2. **Loop detection** — the same (service, action) pair attempted again
+//!    within `DUPLICATE_WINDOW_MINUTES` of a still-standing attempt is
+//!    suppressed instead of re-run.
+//! 3. **Permission tier** — `permissions::check_*` decides `Auto` (logged
+//!    `completed`) vs `Confirm` (logged `pending_confirmation`).
+//!
 //! There's still no real pod/infra execution, sandboxing, or a genuine
 //! idempotency check *inside* the infrastructure call itself — see spec's
-//! Harness Engineering section — but repeated *requests* are now
-//! code-enforced, not left to the model to not-do.
+//! Harness Engineering section — but which of the above stops an action,
+//! if any, is now code-enforced, not left to the model to not-do.
 
 use crate::permissions::{self, Tier};
 use crate::tools;
@@ -24,43 +27,64 @@ const DUPLICATE_WINDOW_MINUTES: i64 = 15;
 /// Executes a free-form remediation action against a service.
 /// `criticality` is the service's tier ("critical"/"medium"/"low"); the
 /// caller looks it up, since this function only decides what to do with it.
+/// `incident_service` is the service this incident is scoped to (from the
+/// original alert) — `service` must match it or the action is refused.
 pub async fn execute_remediation(
     pool: &PgPool,
     service: &str,
     criticality: &str,
     action: &str,
+    incident_service: &str,
 ) -> Result<Tier, sqlx::Error> {
-    guarded(pool, service, action, || {
+    guarded(pool, service, action, incident_service, || {
         permissions::check_execute_remediation(action, criticality)
     })
     .await
 }
 
 /// Scales a service by a signed percentage.
-pub async fn scale_service(pool: &PgPool, service: &str, target_percent: i32) -> Result<Tier, sqlx::Error> {
+pub async fn scale_service(
+    pool: &PgPool,
+    service: &str,
+    target_percent: i32,
+    incident_service: &str,
+) -> Result<Tier, sqlx::Error> {
     let action = format!("scale_service {target_percent:+}%");
-    guarded(pool, service, &action, || permissions::check_scale_service(target_percent)).await
+    guarded(pool, service, &action, incident_service, || {
+        permissions::check_scale_service(target_percent)
+    })
+    .await
 }
 
 /// Rolls a service's deployment back to its last known-good version.
-pub async fn rollback_deployment(pool: &PgPool, service: &str) -> Result<Tier, sqlx::Error> {
-    guarded(pool, service, "rollback_deployment", permissions::check_rollback_deployment).await
+pub async fn rollback_deployment(pool: &PgPool, service: &str, incident_service: &str) -> Result<Tier, sqlx::Error> {
+    guarded(pool, service, "rollback_deployment", incident_service, permissions::check_rollback_deployment).await
 }
 
 /// Deletes a named infrastructure resource.
-pub async fn delete_resource(pool: &PgPool, service: &str, resource: &str) -> Result<Tier, sqlx::Error> {
+pub async fn delete_resource(
+    pool: &PgPool,
+    service: &str,
+    resource: &str,
+    incident_service: &str,
+) -> Result<Tier, sqlx::Error> {
     let action = format!("delete_resource {resource}");
-    guarded(pool, service, &action, permissions::check_delete_resource).await
+    guarded(pool, service, &action, incident_service, permissions::check_delete_resource).await
 }
 
-/// Runs the loop-detection check first; only if it's not a duplicate does
-/// it fall through to `decide_tier` (the actual permission check) and persist.
+/// Cross-service check first, then loop detection, then `decide_tier` (the
+/// actual permission check) — persisting whichever verdict wins.
 async fn guarded(
     pool: &PgPool,
     service: &str,
     action: &str,
+    incident_service: &str,
     decide_tier: impl FnOnce() -> Tier,
 ) -> Result<Tier, sqlx::Error> {
+    if let Some(cross_service) = permissions::check_cross_service(service, incident_service) {
+        persist(pool, service, action, &cross_service).await?;
+        return Ok(cross_service);
+    }
     if let Some(duplicate) = check_recent_duplicate(pool, service, action).await? {
         persist(pool, service, action, &duplicate).await?;
         return Ok(duplicate);
@@ -101,12 +125,14 @@ async fn check_recent_duplicate(
 
 /// Records the action with a status that reflects the verdict:
 /// `completed` if it actually ran, `pending_confirmation` if a permission
-/// guardrail blocked it, `duplicate_suppressed` if loop detection did.
+/// guardrail blocked it, `duplicate_suppressed` if loop detection did,
+/// `cross_service_blocked` if it targeted a service outside this incident's scope.
 async fn persist(pool: &PgPool, service: &str, action: &str, tier: &Tier) -> Result<(), sqlx::Error> {
     let status = match tier {
         Tier::Auto => "completed",
         Tier::Confirm(_) => "pending_confirmation",
         Tier::Duplicate(_) => "duplicate_suppressed",
+        Tier::CrossService(_) => "cross_service_blocked",
     };
     sqlx::query(
         "INSERT INTO remediation_log (service, action, status, timestamp)
@@ -163,12 +189,12 @@ mod tests {
         let pool = test_pool().await;
         let service = "test-skeleton-loop-completed";
 
-        let first = execute_remediation(&pool, service, "low", "restart_pod").await.unwrap();
+        let first = execute_remediation(&pool, service, "low", "restart_pod", service).await.unwrap();
         assert_eq!(first, Tier::Auto);
 
         // Same service, same action, retried immediately — this is exactly
         // the "agent keeps restarting the same pod" failure mode.
-        let second = execute_remediation(&pool, service, "low", "restart_pod").await.unwrap();
+        let second = execute_remediation(&pool, service, "low", "restart_pod", service).await.unwrap();
         assert!(matches!(second, Tier::Duplicate(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -187,10 +213,10 @@ mod tests {
 
         // rollback_deployment is always Confirm, i.e. always leaves a
         // pending_confirmation row — spamming it shouldn't pile up more.
-        let first = rollback_deployment(&pool, service).await.unwrap();
+        let first = rollback_deployment(&pool, service, service).await.unwrap();
         assert!(matches!(first, Tier::Confirm(_)));
 
-        let second = rollback_deployment(&pool, service).await.unwrap();
+        let second = rollback_deployment(&pool, service, service).await.unwrap();
         assert!(matches!(second, Tier::Duplicate(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -206,8 +232,8 @@ mod tests {
         let pool = test_pool().await;
         let service = "test-skeleton-loop-different-actions";
 
-        let restart = execute_remediation(&pool, service, "low", "restart_pod").await.unwrap();
-        let scale = scale_service(&pool, service, 10).await.unwrap();
+        let restart = execute_remediation(&pool, service, "low", "restart_pod", service).await.unwrap();
+        let scale = scale_service(&pool, service, 10, service).await.unwrap();
         assert_eq!(restart, Tier::Auto);
         assert_eq!(scale, Tier::Auto); // not suppressed — different action
 
@@ -223,8 +249,8 @@ mod tests {
         let pool = test_pool().await;
         let (service_a, service_b) = ("test-skeleton-loop-svc-a", "test-skeleton-loop-svc-b");
 
-        let a = execute_remediation(&pool, service_a, "low", "restart_pod").await.unwrap();
-        let b = execute_remediation(&pool, service_b, "low", "restart_pod").await.unwrap();
+        let a = execute_remediation(&pool, service_a, "low", "restart_pod", service_a).await.unwrap();
+        let b = execute_remediation(&pool, service_b, "low", "restart_pod", service_b).await.unwrap();
         assert_eq!(a, Tier::Auto);
         assert_eq!(b, Tier::Auto); // not suppressed — different service
 
@@ -236,7 +262,7 @@ mod tests {
     async fn restart_pod_on_non_critical_service_is_auto_approved() {
         let pool = test_pool().await;
         let service = "test-skeleton-restart-low";
-        let tier = execute_remediation(&pool, service, "low", "restart_pod").await.unwrap();
+        let tier = execute_remediation(&pool, service, "low", "restart_pod", service).await.unwrap();
         assert_eq!(tier, Tier::Auto);
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -250,7 +276,7 @@ mod tests {
     async fn restart_pod_on_critical_service_requires_confirmation() {
         let pool = test_pool().await;
         let service = "test-skeleton-restart-critical";
-        let tier = execute_remediation(&pool, service, "critical", "restart_pod").await.unwrap();
+        let tier = execute_remediation(&pool, service, "critical", "restart_pod", service).await.unwrap();
         assert!(matches!(tier, Tier::Confirm(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -263,7 +289,7 @@ mod tests {
     async fn scale_service_within_range_is_auto_approved() {
         let pool = test_pool().await;
         let service = "test-skeleton-scale-ok";
-        let tier = scale_service(&pool, service, 20).await.unwrap();
+        let tier = scale_service(&pool, service, 20, service).await.unwrap();
         assert_eq!(tier, Tier::Auto);
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -277,7 +303,7 @@ mod tests {
     async fn scale_service_outside_range_requires_confirmation() {
         let pool = test_pool().await;
         let service = "test-skeleton-scale-big";
-        let tier = scale_service(&pool, service, -50).await.unwrap();
+        let tier = scale_service(&pool, service, -50, service).await.unwrap();
         assert!(matches!(tier, Tier::Confirm(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -291,7 +317,7 @@ mod tests {
     async fn rollback_deployment_always_requires_confirmation() {
         let pool = test_pool().await;
         let service = "test-skeleton-rollback";
-        let tier = rollback_deployment(&pool, service).await.unwrap();
+        let tier = rollback_deployment(&pool, service, service).await.unwrap();
         assert!(matches!(tier, Tier::Confirm(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();
@@ -305,7 +331,7 @@ mod tests {
     async fn delete_resource_always_requires_confirmation() {
         let pool = test_pool().await;
         let service = "test-skeleton-delete";
-        let tier = delete_resource(&pool, service, "checkout-service-prod-cache").await.unwrap();
+        let tier = delete_resource(&pool, service, "checkout-service-prod-cache", service).await.unwrap();
         assert!(matches!(tier, Tier::Confirm(_)));
 
         let log = get_remediation_log_for_service(&pool, service).await.unwrap();

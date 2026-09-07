@@ -7,6 +7,12 @@
 //! `Duplicate` is a distinct verdict from loop detection (`actions.rs`
 //! checks recent history before consulting `check_*` at all) — it means
 //! "this exact action was already attempted recently," not "denied."
+//!
+//! `CrossService` is checked before anything else in `actions.rs`: a
+//! remediation action targeting a service other than the one this
+//! incident is about is refused regardless of criticality, percentage, or
+//! action type — this is what a poisoned runbook trying to redirect
+//! remediation at an unrelated service runs into.
 
 const SCALE_AUTO_RANGE_PERCENT: i32 = 20;
 
@@ -15,6 +21,21 @@ pub enum Tier {
     Auto,
     Confirm(String),
     Duplicate(String),
+    CrossService(String),
+}
+
+/// Refuses a remediation action whose target service isn't the service
+/// this incident is scoped to. Case-insensitive so "Checkout-Service" vs
+/// "checkout-service" doesn't slip through as a mismatch.
+pub fn check_cross_service(target_service: &str, incident_service: &str) -> Option<Tier> {
+    if target_service.eq_ignore_ascii_case(incident_service) {
+        None
+    } else {
+        Some(Tier::CrossService(format!(
+            "'{target_service}' is not the service this incident is about ('{incident_service}') \
+             — refusing a cross-service remediation action"
+        )))
+    }
 }
 
 /// restart_pod (via execute_remediation): auto unless the service is critical.
@@ -94,5 +115,23 @@ mod tests {
     fn rollback_and_delete_are_never_auto() {
         assert!(matches!(check_rollback_deployment(), Tier::Confirm(_)));
         assert!(matches!(check_delete_resource(), Tier::Confirm(_)));
+    }
+
+    #[test]
+    fn same_service_passes_cross_service_check() {
+        assert_eq!(check_cross_service("checkout-service", "checkout-service"), None);
+    }
+
+    #[test]
+    fn same_service_case_insensitive_passes() {
+        assert_eq!(check_cross_service("Checkout-Service", "checkout-service"), None);
+    }
+
+    #[test]
+    fn different_service_is_refused() {
+        assert!(matches!(
+            check_cross_service("checkout-service", "recommendation-service"),
+            Some(Tier::CrossService(_))
+        ));
     }
 }
