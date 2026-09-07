@@ -1,0 +1,121 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_services",
+      "description": "Lists all known services with their criticality tier (critical/medium/low) and owning team.",
+      "parameters": { "type": "object", "properties": {}, "required": [] }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_metrics_for_service",
+      "description": "Returns near-real-time metrics (p99 latency ms, error rate, CPU percent, timestamp) for one service, oldest first.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string", "description": "Service name, e.g. checkout-service" }
+        },
+        "required": ["service"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_logs_for_service",
+      "description": "Returns legacy log-export rows for one service (batch-based, not real-time). Uses svc_name and a date string (MM/DD/YYYY) — different field names than the metrics source.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "svc_name": { "type": "string", "description": "Service name as recorded in the legacy log export" }
+        },
+        "required": ["svc_name"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_incidents_for_service",
+      "description": "Returns known incidents for one service, most recent first.",
+      "parameters": {
+        "type": "object",
+        "properties": { "service": { "type": "string" } },
+        "required": ["service"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_incident_updates",
+      "description": "Returns status updates already posted for one incident, oldest first.",
+      "parameters": {
+        "type": "object",
+        "properties": { "incident_id": { "type": "string" } },
+        "required": ["incident_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_remediation_log_for_service",
+      "description": "Returns remediation actions already taken for one service, most recent first.",
+      "parameters": {
+        "type": "object",
+        "properties": { "service": { "type": "string" } },
+        "required": ["service"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_runbooks",
+      "description": "Keyword-searches the runbook knowledge base and returns matching docs ranked by relevance, each with a preview snippet.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Free-text symptoms/keywords, e.g. 'connection pool exhausted payment-gateway timeout'"
+          }
+        },
+        "required": ["query"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "execute_remediation",
+      "description": "Executes a remediation action against a service and logs it. Skeleton only — not yet gated by a permission/risk-tier guardrail layer.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service": { "type": "string" },
+          "action": { "type": "string", "description": "e.g. restart_pod, scale_service, rollback_deployment" }
+        },
+        "required": ["service", "action"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "post_incident_update",
+      "description": "Posts a human-readable status update against an incident.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "incident_id": { "type": "string" },
+          "message": { "type": "string" }
+        },
+        "required": ["incident_id", "message"]
+      }
+    }
+  }
+]
