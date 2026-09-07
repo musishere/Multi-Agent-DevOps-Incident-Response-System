@@ -337,13 +337,16 @@ fn advance_phase(state: &mut IncidentState, final_text: String, alert: &str, tra
 
 /// Calls Groq, retrying on a rate-limit response (the free tier's TPM cap
 /// is easy to hit once the tool-call history grows across a few turns).
+/// Sleeps for the exact wait time Groq's error message names, not a fixed
+/// guess — a flat 5s retry isn't always enough once the eval suite runs
+/// several pipeline calls back to back.
 async fn call_groq(
     client: &reqwest::Client,
     api_key: &str,
     body: &Value,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-    const MAX_RETRIES: u32 = 3;
+    const FALLBACK_RETRY_DELAY_SECS: f64 = 5.0;
+    const MAX_RETRIES: u32 = 5;
 
     for attempt in 0..=MAX_RETRIES {
         let response: Value = client
@@ -361,8 +364,10 @@ async fn call_groq(
 
         let is_rate_limit = response["error"]["code"].as_str() == Some("rate_limit_exceeded");
         if is_rate_limit && attempt < MAX_RETRIES {
-            eprintln!("-> rate limited, retrying in {}s...", RETRY_DELAY.as_secs());
-            tokio::time::sleep(RETRY_DELAY).await;
+            let message = response["error"]["message"].as_str().unwrap_or("");
+            let wait = parse_retry_after_secs(message).unwrap_or(FALLBACK_RETRY_DELAY_SECS) + 1.0;
+            eprintln!("-> rate limited, retrying in {wait:.1}s...");
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait)).await;
             continue;
         }
 
@@ -370,4 +375,31 @@ async fn call_groq(
     }
 
     unreachable!()
+}
+
+/// Parses "...try again in 14.1825s..." out of Groq's rate-limit message.
+fn parse_retry_after_secs(message: &str) -> Option<f64> {
+    let marker = "try again in ";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('s')?;
+    rest[..end].trim().parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_real_groq_message_format() {
+        let msg = "Rate limit reached for model `openai/gpt-oss-120b` in organization \
+                   `org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, \
+                   Used 4980, Requested 4911. Please try again in 14.1825s. Need more tokens?";
+        assert_eq!(parse_retry_after_secs(msg), Some(14.1825));
+    }
+
+    #[test]
+    fn returns_none_for_an_unrelated_message() {
+        assert_eq!(parse_retry_after_secs("some other error entirely"), None);
+    }
 }

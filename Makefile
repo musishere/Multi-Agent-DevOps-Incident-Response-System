@@ -1,7 +1,7 @@
 DB_NAME := incident_response
 PSQL := PGPASSWORD=postgres psql -U postgres -h localhost
 
-.PHONY: build run test seed agent db-create db-drop db-reset clean
+.PHONY: build run test seed agent eval eval-held-out db-create db-drop db-reset clean
 
 build:
 	cargo build
@@ -17,6 +17,12 @@ seed:
 
 agent:
 	cargo run --bin agent
+
+eval:
+	cargo run --bin eval
+
+eval-held-out:
+	cargo run --bin eval -- --held-out
 
 db-create:
 	$(PSQL) -c "CREATE DATABASE $(DB_NAME);"
