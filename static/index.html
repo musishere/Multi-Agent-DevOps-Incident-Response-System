@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IncidentIQ</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121822;
+    --border: #232d3a;
+    --text: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #4f9dff;
+    --ok: #3fbf6b;
+    --warn: #e0a83e;
+    --bad: #e0543e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 24px 32px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 20px; }
+  header p { margin: 0 0 16px; color: var(--muted); font-size: 14px; }
+  main {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 24px 32px 64px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  textarea {
+    width: 100%;
+    min-height: 70px;
+    resize: vertical;
+    background: #0d1420;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 14px;
+    font-family: inherit;
+  }
+  .examples { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .examples button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .examples button:hover { border-color: var(--accent); color: var(--text); }
+  .row { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  #trigger {
+    background: var(--accent);
+    color: #051224;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #trigger:disabled { opacity: 0.5; cursor: default; }
+  #status-line { font-size: 13px; color: var(--muted); }
+  .hidden { display: none !important; }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.done { background: rgba(63,191,107,0.15); color: var(--ok); }
+  .badge.refused { background: rgba(224,168,62,0.15); color: var(--warn); }
+  .badge.progress { background: rgba(224,168,62,0.15); color: var(--warn); }
+  .badge.error { background: rgba(224,84,62,0.15); color: var(--bad); }
+  .field-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 14px 0 4px; }
+  .field-label:first-child { margin-top: 0; }
+  pre.summary {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin: 0;
+    font-family: inherit;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  details summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-size: 13px;
+    margin-top: 8px;
+  }
+  .trace-event {
+    border-bottom: 1px solid var(--border);
+    padding: 8px 0;
+    font-size: 12px;
+  }
+  .trace-event:last-child { border-bottom: none; }
+  .trace-event .meta { color: var(--muted); margin-bottom: 3px; }
+  .trace-event .meta .kind { color: var(--text); font-weight: 600; }
+  .trace-event pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .spinner {
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    display: inline-block;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>IncidentIQ</h1>
+  <p>Trigger an incident through the real Diagnose → Remediate → Communicate pipeline.</p>
+</header>
+
+<main>
+  <div class="panel">
+    <label for="alert">Alert</label>
+    <textarea id="alert">API latency spike on checkout-service, p99 > 2000ms for 5 minutes.</textarea>
+    <div class="examples">
+      <button data-alert="API latency spike on checkout-service, p99 > 2000ms for 5 minutes.">Checkout latency spike</button>
+      <button data-alert="Elevated latency on recommendation-service, possible cache issue.">Recommendation cache issue</button>
+      <button data-alert="Write me a poem about clouds.">Off-topic (tests scope guardrail)</button>
+    </div>
+    <div class="row">
+      <button id="trigger">Investigate</button>
+      <span id="status-line"></span>
+    </div>
+  </div>
+
+  <div id="result" class="panel hidden"></div>
+</main>
+
+<script>
+const alertBox = document.getElementById('alert');
+const triggerBtn = document.getElementById('trigger');
+const statusLine = document.getElementById('status-line');
+const resultPanel = document.getElementById('result');
+
+document.querySelectorAll('.examples button').forEach(btn => {
+  btn.addEventListener('click', () => { alertBox.value = btn.dataset.alert; });
+});
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function renderTraceEvent(e) {
+  const detail = JSON.stringify(e.detail, null, 2);
+  return `<div class="trace-event">
+    <div class="meta"><span class="kind">${escapeHtml(e.event)}</span> · ${escapeHtml(e.phase)} · ${escapeHtml(e.timestamp)}</div>
+    <pre>${escapeHtml(detail)}</pre>
+  </div>`;
+}
+
+async function loadTrace(incidentId) {
+  try {
+    const res = await fetch(`/api/incidents/${encodeURIComponent(incidentId)}/trace`);
+    if (!res.ok) return '<p style="color:var(--muted)">No trace available.</p>';
+    const events = await res.json();
+    return events.map(renderTraceEvent).join('');
+  } catch {
+    return '<p style="color:var(--muted)">Failed to load trace.</p>';
+  }
+}
+
+function badge(text, cls) {
+  return `<span class="badge ${cls}">${escapeHtml(text)}</span>`;
+}
+
+async function trigger() {
+  const alert = alertBox.value.trim();
+  if (!alert) return;
+
+  triggerBtn.disabled = true;
+  statusLine.innerHTML = '<span class="spinner"></span> Running Diagnose → Remediate → Communicate — this can take up to a minute (Groq free-tier rate limits retry automatically).';
+  resultPanel.classList.add('hidden');
+
+  try {
+    const res = await fetch('/api/incidents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ alert }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      resultPanel.innerHTML = `${badge('Error', 'error')}<p class="field-label"></p><pre class="summary">${escapeHtml(data.error || 'Unknown error')}</pre>`;
+      resultPanel.classList.remove('hidden');
+      return;
+    }
+
+    const refused = data.final_phase === null;
+    const badgeHtml = refused
+      ? badge('Refused — out of scope', 'refused')
+      : data.final_phase === 'Done'
+        ? badge('Done', 'done')
+        : badge(`Stopped at ${data.final_phase}`, 'progress');
+
+    let html = `<div>${badgeHtml} <span style="color:var(--muted);font-size:12px">${escapeHtml(data.incident_id)}</span></div>`;
+
+    if (refused) {
+      html += `<p class="field-label">Reason</p><pre class="summary">This alert doesn't name a known service, so the scope guardrail refused it before the model was ever called.</pre>`;
+    } else {
+      if (data.diagnosis_summary) {
+        html += `<p class="field-label">Diagnosis</p><pre class="summary">${escapeHtml(data.diagnosis_summary)}</pre>`;
+      }
+      if (data.remediation_summary) {
+        html += `<p class="field-label">Remediation</p><pre class="summary">${escapeHtml(data.remediation_summary)}</pre>`;
+      }
+    }
+
+    html += `<details><summary>View trace</summary><div id="trace-container">Loading…</div></details>`;
+    resultPanel.innerHTML = html;
+    resultPanel.classList.remove('hidden');
+
+    const traceContainer = document.getElementById('trace-container');
+    document.querySelector('#result details').addEventListener('toggle', async function handler(e) {
+      if (e.target.open) {
+        traceContainer.innerHTML = await loadTrace(data.incident_id);
+      }
+    });
+  } catch (err) {
+    resultPanel.innerHTML = `${badge('Error', 'error')}<pre class="summary">${escapeHtml(String(err))}</pre>`;
+    resultPanel.classList.remove('hidden');
+  } finally {
+    triggerBtn.disabled = false;
+    statusLine.textContent = '';
+  }
+}
+
+triggerBtn.addEventListener('click', trigger);
+</script>
+
+</body>
+</html>

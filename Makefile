@@ -1,7 +1,7 @@
 DB_NAME := incident_response
 PSQL := PGPASSWORD=postgres psql -U postgres -h localhost
 
-.PHONY: build run test seed agent eval eval-held-out db-create db-drop db-reset clean
+.PHONY: build run test seed agent eval eval-held-out server frontend db-create db-drop db-reset clean
 
 build:
 	cargo build
@@ -23,6 +23,12 @@ eval:
 
 eval-held-out:
 	cargo run --bin eval -- --held-out
+
+server:
+	cargo run --bin server
+
+# Alias: the server binary serves both the API and the static frontend.
+frontend: server
 
 db-create:
 	$(PSQL) -c "CREATE DATABASE $(DB_NAME);"

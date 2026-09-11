@@ -27,7 +27,7 @@ const GROQ_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 // same action retried repeatedly) — see spec's Harness Engineering section.
 const MAX_MODEL_CALLS: usize = 12;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub enum Phase {
     Diagnose,
     Remediate,
@@ -36,9 +36,10 @@ pub enum Phase {
 }
 
 /// What a completed (or refused) incident run looked like, for a caller
-/// (interactive CLI or eval case) to inspect. Callers that need per-tool-call
-/// detail read the run's `traces/<incident_id>.jsonl` back — no need to
-/// duplicate that structure here.
+/// (interactive CLI, eval case, or the HTTP API) to inspect. Callers that
+/// need per-tool-call detail read the run's `traces/<incident_id>.jsonl`
+/// back — no need to duplicate that structure here.
+#[derive(serde::Serialize)]
 pub struct IncidentOutcome {
     pub incident_id: String,
     /// `None` if the scope guardrail refused the alert before the phase
